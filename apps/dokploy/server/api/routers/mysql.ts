@@ -3,6 +3,7 @@ import {
 	createMount,
 	createMysql,
 	deployMySql,
+	executeTransfer,
 	execAsync,
 	execAsyncRemote,
 	findBackupsByDbId,
@@ -17,6 +18,7 @@ import {
 	rebuildDatabase,
 	removeMySqlById,
 	removeService,
+	scanServiceForTransfer,
 	startService,
 	startServiceRemote,
 	stopService,
@@ -31,6 +33,7 @@ import {
 	findMemberByUserId,
 } from "@dokploy/server/services/permission";
 import { TRPCError } from "@trpc/server";
+import { observable } from "@trpc/server/observable";
 import { and, desc, eq, ilike, or, sql } from "drizzle-orm";
 import { z } from "zod";
 import { createTRPCRouter, protectedProcedure } from "@/server/api/trpc";
@@ -44,6 +47,7 @@ import {
 	apiResetMysql,
 	apiSaveEnvironmentVariablesMySql,
 	apiSaveExternalPortMySql,
+	apiTransferMySql,
 	apiUpdateMySql,
 	DATABASE_PASSWORD_MESSAGE,
 	DATABASE_PASSWORD_REGEX,
@@ -52,6 +56,12 @@ import {
 	projects,
 } from "@/server/db/schema";
 import { cancelJobs } from "@/server/utils/backup";
+import {
+	runTransferWithDowntime,
+	startSourceDockerService,
+	stopSourceDockerService,
+	validateTransferTargetServer,
+} from "@/server/utils/transfer";
 
 export const mysqlRouter = createTRPCRouter({
 	create: protectedProcedure
@@ -644,5 +654,171 @@ export const mysqlRouter = createTRPCRouter({
 				input.search,
 				mysql.serverId,
 			);
+		}),
+
+	transferScan: protectedProcedure
+		.input(apiTransferMySql)
+		.mutation(async ({ input, ctx }) => {
+			await checkServiceAccess(ctx, input.mysqlId, "delete");
+			const mysql = await findMySqlById(input.mysqlId);
+
+			if (
+				mysql.environment.project.organizationId !==
+				ctx.session.activeOrganizationId
+			) {
+				throw new TRPCError({
+					code: "UNAUTHORIZED",
+					message: "You are not authorized to transfer this MySQL",
+				});
+			}
+
+			const targetServerId = await validateTransferTargetServer({
+				targetServerId: input.targetServerId,
+				sourceServerId: mysql.serverId,
+				organizationId: ctx.session.activeOrganizationId,
+			});
+
+			return scanServiceForTransfer({
+				serviceId: input.mysqlId,
+				serviceType: "mysql",
+				appName: mysql.appName,
+				sourceServerId: mysql.serverId,
+				targetServerId,
+			});
+		}),
+
+	transfer: protectedProcedure
+		.input(
+			apiTransferMySql.extend({
+				decisions: z.record(z.string(), z.enum(["skip", "overwrite"])).optional(),
+			}),
+		)
+		.mutation(async ({ input, ctx }) => {
+			await checkServiceAccess(ctx, input.mysqlId, "delete");
+			const mysql = await findMySqlById(input.mysqlId);
+
+			if (
+				mysql.environment.project.organizationId !==
+				ctx.session.activeOrganizationId
+			) {
+				throw new TRPCError({
+					code: "UNAUTHORIZED",
+					message: "You are not authorized to transfer this MySQL",
+				});
+			}
+
+			const targetServerId = await validateTransferTargetServer({
+				targetServerId: input.targetServerId,
+				sourceServerId: mysql.serverId,
+				organizationId: ctx.session.activeOrganizationId,
+			});
+
+			const result = await runTransferWithDowntime({
+				stopSource: async () => {
+					await stopSourceDockerService(mysql.serverId, mysql.appName);
+				},
+				startSource: async () => {
+					await startSourceDockerService(mysql.serverId, mysql.appName);
+				},
+				executeTransfer: async () =>
+					executeTransfer(
+						{
+							serviceId: input.mysqlId,
+							serviceType: "mysql",
+							appName: mysql.appName,
+							sourceServerId: mysql.serverId,
+							targetServerId,
+						},
+						input.decisions || {},
+					),
+				commitTransfer: async () => {
+					await db
+						.update(mysqlTable)
+						.set({ serverId: targetServerId })
+						.where(eq(mysqlTable.mysqlId, input.mysqlId));
+				},
+			});
+
+			if (!result.success) {
+				throw new TRPCError({
+					code: "INTERNAL_SERVER_ERROR",
+					message: `Transfer failed: ${result.errors.join(", ")}`,
+				});
+			}
+
+			return { success: true };
+		}),
+
+	transferWithLogs: protectedProcedure
+		.input(
+			apiTransferMySql.extend({
+				decisions: z.record(z.string(), z.enum(["skip", "overwrite"])).optional(),
+			}),
+		)
+		.subscription(async ({ input, ctx }) => {
+			await checkServiceAccess(ctx, input.mysqlId, "delete");
+			const mysql = await findMySqlById(input.mysqlId);
+
+			if (
+				mysql.environment.project.organizationId !==
+				ctx.session.activeOrganizationId
+			) {
+				throw new TRPCError({
+					code: "UNAUTHORIZED",
+					message: "You are not authorized to transfer this MySQL",
+				});
+			}
+
+			const targetServerId = await validateTransferTargetServer({
+				targetServerId: input.targetServerId,
+				sourceServerId: mysql.serverId,
+				organizationId: ctx.session.activeOrganizationId,
+			});
+
+			return observable<string>((emit) => {
+				runTransferWithDowntime({
+					stopSource: async () => {
+						await stopSourceDockerService(mysql.serverId, mysql.appName);
+					},
+					startSource: async () => {
+						await startSourceDockerService(mysql.serverId, mysql.appName);
+					},
+					executeTransfer: async () =>
+						executeTransfer(
+							{
+								serviceId: input.mysqlId,
+								serviceType: "mysql",
+								appName: mysql.appName,
+								sourceServerId: mysql.serverId,
+								targetServerId,
+							},
+							input.decisions || {},
+							(progress) => {
+								emit.next(JSON.stringify(progress));
+							},
+						),
+					commitTransfer: async () => {
+						await db
+							.update(mysqlTable)
+							.set({ serverId: targetServerId })
+							.where(eq(mysqlTable.mysqlId, input.mysqlId));
+					},
+				})
+					.then((result) => {
+						if (result.success) {
+							emit.next("Transfer completed successfully!");
+						} else {
+							const errorMessage = result.errors.join(", ") || "Unknown error";
+							emit.next(`Transfer failed: ${errorMessage}`);
+						}
+						emit.complete();
+					})
+					.catch((error) => {
+						const message =
+							error instanceof Error ? error.message : "Unknown transfer error";
+						emit.next(`Transfer failed: ${message}`);
+						emit.complete();
+					});
+			});
 		}),
 });

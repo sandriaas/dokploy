@@ -3,6 +3,7 @@ import {
 	createMongo,
 	createMount,
 	deployMongo,
+	executeTransfer,
 	execAsync,
 	execAsyncRemote,
 	findBackupsByDbId,
@@ -17,6 +18,7 @@ import {
 	rebuildDatabase,
 	removeMongoById,
 	removeService,
+	scanServiceForTransfer,
 	startService,
 	startServiceRemote,
 	stopService,
@@ -31,6 +33,7 @@ import {
 	findMemberByUserId,
 } from "@dokploy/server/services/permission";
 import { TRPCError } from "@trpc/server";
+import { observable } from "@trpc/server/observable";
 import { and, desc, eq, ilike, or, sql } from "drizzle-orm";
 import { z } from "zod";
 import { createTRPCRouter, protectedProcedure } from "@/server/api/trpc";
@@ -44,6 +47,7 @@ import {
 	apiResetMongo,
 	apiSaveEnvironmentVariablesMongo,
 	apiSaveExternalPortMongo,
+	apiTransferMongo,
 	apiUpdateMongo,
 	DATABASE_PASSWORD_MESSAGE,
 	DATABASE_PASSWORD_REGEX,
@@ -52,6 +56,12 @@ import {
 	projects,
 } from "@/server/db/schema";
 import { cancelJobs } from "@/server/utils/backup";
+import {
+	runTransferWithDowntime,
+	startSourceDockerService,
+	stopSourceDockerService,
+	validateTransferTargetServer,
+} from "@/server/utils/transfer";
 export const mongoRouter = createTRPCRouter({
 	create: protectedProcedure
 		.input(apiCreateMongo)
@@ -641,5 +651,171 @@ export const mongoRouter = createTRPCRouter({
 				input.search,
 				mongo.serverId,
 			);
+		}),
+
+	transferScan: protectedProcedure
+		.input(apiTransferMongo)
+		.mutation(async ({ input, ctx }) => {
+			await checkServiceAccess(ctx, input.mongoId, "delete");
+			const mongo = await findMongoById(input.mongoId);
+
+			if (
+				mongo.environment.project.organizationId !==
+				ctx.session.activeOrganizationId
+			) {
+				throw new TRPCError({
+					code: "UNAUTHORIZED",
+					message: "You are not authorized to transfer this MongoDB",
+				});
+			}
+
+			const targetServerId = await validateTransferTargetServer({
+				targetServerId: input.targetServerId,
+				sourceServerId: mongo.serverId,
+				organizationId: ctx.session.activeOrganizationId,
+			});
+
+			return scanServiceForTransfer({
+				serviceId: input.mongoId,
+				serviceType: "mongo",
+				appName: mongo.appName,
+				sourceServerId: mongo.serverId,
+				targetServerId,
+			});
+		}),
+
+	transfer: protectedProcedure
+		.input(
+			apiTransferMongo.extend({
+				decisions: z.record(z.string(), z.enum(["skip", "overwrite"])).optional(),
+			}),
+		)
+		.mutation(async ({ input, ctx }) => {
+			await checkServiceAccess(ctx, input.mongoId, "delete");
+			const mongo = await findMongoById(input.mongoId);
+
+			if (
+				mongo.environment.project.organizationId !==
+				ctx.session.activeOrganizationId
+			) {
+				throw new TRPCError({
+					code: "UNAUTHORIZED",
+					message: "You are not authorized to transfer this MongoDB",
+				});
+			}
+
+			const targetServerId = await validateTransferTargetServer({
+				targetServerId: input.targetServerId,
+				sourceServerId: mongo.serverId,
+				organizationId: ctx.session.activeOrganizationId,
+			});
+
+			const result = await runTransferWithDowntime({
+				stopSource: async () => {
+					await stopSourceDockerService(mongo.serverId, mongo.appName);
+				},
+				startSource: async () => {
+					await startSourceDockerService(mongo.serverId, mongo.appName);
+				},
+				executeTransfer: async () =>
+					executeTransfer(
+						{
+							serviceId: input.mongoId,
+							serviceType: "mongo",
+							appName: mongo.appName,
+							sourceServerId: mongo.serverId,
+							targetServerId,
+						},
+						input.decisions || {},
+					),
+				commitTransfer: async () => {
+					await db
+						.update(mongoTable)
+						.set({ serverId: targetServerId })
+						.where(eq(mongoTable.mongoId, input.mongoId));
+				},
+			});
+
+			if (!result.success) {
+				throw new TRPCError({
+					code: "INTERNAL_SERVER_ERROR",
+					message: `Transfer failed: ${result.errors.join(", ")}`,
+				});
+			}
+
+			return { success: true };
+		}),
+
+	transferWithLogs: protectedProcedure
+		.input(
+			apiTransferMongo.extend({
+				decisions: z.record(z.string(), z.enum(["skip", "overwrite"])).optional(),
+			}),
+		)
+		.subscription(async ({ input, ctx }) => {
+			await checkServiceAccess(ctx, input.mongoId, "delete");
+			const mongo = await findMongoById(input.mongoId);
+
+			if (
+				mongo.environment.project.organizationId !==
+				ctx.session.activeOrganizationId
+			) {
+				throw new TRPCError({
+					code: "UNAUTHORIZED",
+					message: "You are not authorized to transfer this MongoDB",
+				});
+			}
+
+			const targetServerId = await validateTransferTargetServer({
+				targetServerId: input.targetServerId,
+				sourceServerId: mongo.serverId,
+				organizationId: ctx.session.activeOrganizationId,
+			});
+
+			return observable<string>((emit) => {
+				runTransferWithDowntime({
+					stopSource: async () => {
+						await stopSourceDockerService(mongo.serverId, mongo.appName);
+					},
+					startSource: async () => {
+						await startSourceDockerService(mongo.serverId, mongo.appName);
+					},
+					executeTransfer: async () =>
+						executeTransfer(
+							{
+								serviceId: input.mongoId,
+								serviceType: "mongo",
+								appName: mongo.appName,
+								sourceServerId: mongo.serverId,
+								targetServerId,
+							},
+							input.decisions || {},
+							(progress) => {
+								emit.next(JSON.stringify(progress));
+							},
+						),
+					commitTransfer: async () => {
+						await db
+							.update(mongoTable)
+							.set({ serverId: targetServerId })
+							.where(eq(mongoTable.mongoId, input.mongoId));
+					},
+				})
+					.then((result) => {
+						if (result.success) {
+							emit.next("Transfer completed successfully!");
+						} else {
+							const errorMessage = result.errors.join(", ") || "Unknown error";
+							emit.next(`Transfer failed: ${errorMessage}`);
+						}
+						emit.complete();
+					})
+					.catch((error) => {
+						const message =
+							error instanceof Error ? error.message : "Unknown transfer error";
+						emit.next(`Transfer failed: ${message}`);
+						emit.complete();
+					});
+			});
 		}),
 });

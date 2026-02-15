@@ -3,6 +3,7 @@ import {
 	createMount,
 	createRedis,
 	deployRedis,
+	executeTransfer,
 	execAsync,
 	execAsyncRemote,
 	findEnvironmentById,
@@ -16,6 +17,7 @@ import {
 	rebuildDatabase,
 	removeRedisById,
 	removeService,
+	scanServiceForTransfer,
 	startService,
 	startServiceRemote,
 	stopService,
@@ -30,6 +32,7 @@ import {
 	findMemberByUserId,
 } from "@dokploy/server/services/permission";
 import { TRPCError } from "@trpc/server";
+import { observable } from "@trpc/server/observable";
 import { and, desc, eq, ilike, or, sql } from "drizzle-orm";
 import { z } from "zod";
 import { createTRPCRouter, protectedProcedure } from "@/server/api/trpc";
@@ -43,6 +46,7 @@ import {
 	apiResetRedis,
 	apiSaveEnvironmentVariablesRedis,
 	apiSaveExternalPortRedis,
+	apiTransferRedis,
 	apiUpdateRedis,
 	DATABASE_PASSWORD_MESSAGE,
 	DATABASE_PASSWORD_REGEX,
@@ -50,6 +54,12 @@ import {
 	projects,
 	redis as redisTable,
 } from "@/server/db/schema";
+import {
+	runTransferWithDowntime,
+	startSourceDockerService,
+	stopSourceDockerService,
+	validateTransferTargetServer,
+} from "@/server/utils/transfer";
 export const redisRouter = createTRPCRouter({
 	create: protectedProcedure
 		.input(apiCreateRedis)
@@ -627,5 +637,171 @@ export const redisRouter = createTRPCRouter({
 				input.search,
 				redis.serverId,
 			);
+		}),
+
+	transferScan: protectedProcedure
+		.input(apiTransferRedis)
+		.mutation(async ({ input, ctx }) => {
+			await checkServiceAccess(ctx, input.redisId, "delete");
+			const redis = await findRedisById(input.redisId);
+
+			if (
+				redis.environment.project.organizationId !==
+				ctx.session.activeOrganizationId
+			) {
+				throw new TRPCError({
+					code: "UNAUTHORIZED",
+					message: "You are not authorized to transfer this Redis",
+				});
+			}
+
+			const targetServerId = await validateTransferTargetServer({
+				targetServerId: input.targetServerId,
+				sourceServerId: redis.serverId,
+				organizationId: ctx.session.activeOrganizationId,
+			});
+
+			return scanServiceForTransfer({
+				serviceId: input.redisId,
+				serviceType: "redis",
+				appName: redis.appName,
+				sourceServerId: redis.serverId,
+				targetServerId,
+			});
+		}),
+
+	transfer: protectedProcedure
+		.input(
+			apiTransferRedis.extend({
+				decisions: z.record(z.string(), z.enum(["skip", "overwrite"])).optional(),
+			}),
+		)
+		.mutation(async ({ input, ctx }) => {
+			await checkServiceAccess(ctx, input.redisId, "delete");
+			const redis = await findRedisById(input.redisId);
+
+			if (
+				redis.environment.project.organizationId !==
+				ctx.session.activeOrganizationId
+			) {
+				throw new TRPCError({
+					code: "UNAUTHORIZED",
+					message: "You are not authorized to transfer this Redis",
+				});
+			}
+
+			const targetServerId = await validateTransferTargetServer({
+				targetServerId: input.targetServerId,
+				sourceServerId: redis.serverId,
+				organizationId: ctx.session.activeOrganizationId,
+			});
+
+			const result = await runTransferWithDowntime({
+				stopSource: async () => {
+					await stopSourceDockerService(redis.serverId, redis.appName);
+				},
+				startSource: async () => {
+					await startSourceDockerService(redis.serverId, redis.appName);
+				},
+				executeTransfer: async () =>
+					executeTransfer(
+						{
+							serviceId: input.redisId,
+							serviceType: "redis",
+							appName: redis.appName,
+							sourceServerId: redis.serverId,
+							targetServerId,
+						},
+						input.decisions || {},
+					),
+				commitTransfer: async () => {
+					await db
+						.update(redisTable)
+						.set({ serverId: targetServerId })
+						.where(eq(redisTable.redisId, input.redisId));
+				},
+			});
+
+			if (!result.success) {
+				throw new TRPCError({
+					code: "INTERNAL_SERVER_ERROR",
+					message: `Transfer failed: ${result.errors.join(", ")}`,
+				});
+			}
+
+			return { success: true };
+		}),
+
+	transferWithLogs: protectedProcedure
+		.input(
+			apiTransferRedis.extend({
+				decisions: z.record(z.string(), z.enum(["skip", "overwrite"])).optional(),
+			}),
+		)
+		.subscription(async ({ input, ctx }) => {
+			await checkServiceAccess(ctx, input.redisId, "delete");
+			const redis = await findRedisById(input.redisId);
+
+			if (
+				redis.environment.project.organizationId !==
+				ctx.session.activeOrganizationId
+			) {
+				throw new TRPCError({
+					code: "UNAUTHORIZED",
+					message: "You are not authorized to transfer this Redis",
+				});
+			}
+
+			const targetServerId = await validateTransferTargetServer({
+				targetServerId: input.targetServerId,
+				sourceServerId: redis.serverId,
+				organizationId: ctx.session.activeOrganizationId,
+			});
+
+			return observable<string>((emit) => {
+				runTransferWithDowntime({
+					stopSource: async () => {
+						await stopSourceDockerService(redis.serverId, redis.appName);
+					},
+					startSource: async () => {
+						await startSourceDockerService(redis.serverId, redis.appName);
+					},
+					executeTransfer: async () =>
+						executeTransfer(
+							{
+								serviceId: input.redisId,
+								serviceType: "redis",
+								appName: redis.appName,
+								sourceServerId: redis.serverId,
+								targetServerId,
+							},
+							input.decisions || {},
+							(progress) => {
+								emit.next(JSON.stringify(progress));
+							},
+						),
+					commitTransfer: async () => {
+						await db
+							.update(redisTable)
+							.set({ serverId: targetServerId })
+							.where(eq(redisTable.redisId, input.redisId));
+					},
+				})
+					.then((result) => {
+						if (result.success) {
+							emit.next("Transfer completed successfully!");
+						} else {
+							const errorMessage = result.errors.join(", ") || "Unknown error";
+							emit.next(`Transfer failed: ${errorMessage}`);
+						}
+						emit.complete();
+					})
+					.catch((error) => {
+						const message =
+							error instanceof Error ? error.message : "Unknown transfer error";
+						emit.next(`Transfer failed: ${message}`);
+						emit.complete();
+					});
+			});
 		}),
 });

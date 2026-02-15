@@ -8,6 +8,7 @@ import {
 	createDomain,
 	createMount,
 	deleteMount,
+	executeTransfer,
 	execAsync,
 	execAsyncRemote,
 	findComposeById,
@@ -27,6 +28,7 @@ import {
 	removeComposeDirectory,
 	removeDeploymentsByComposeId,
 	removeDomainById,
+	scanServiceForTransfer,
 	startCompose,
 	stopCompose,
 	updateCompose,
@@ -47,6 +49,7 @@ import {
 } from "@dokploy/server/templates/github";
 import { processTemplate } from "@dokploy/server/templates/processors";
 import { TRPCError } from "@trpc/server";
+import { observable } from "@trpc/server/observable";
 import { and, desc, eq, ilike, or, sql } from "drizzle-orm";
 import _ from "lodash";
 import { nanoid } from "nanoid";
@@ -63,6 +66,7 @@ import {
 	apiRandomizeCompose,
 	apiRedeployCompose,
 	apiSaveEnvironmentVariablesCompose,
+	apiTransferCompose,
 	apiUpdateCompose,
 	compose as composeTable,
 	environments,
@@ -77,6 +81,7 @@ import {
 	myQueue,
 } from "@/server/queues/queueSetup";
 import { cancelDeployment, deploy } from "@/server/utils/deploy";
+import { runTransferWithDowntime, validateTransferTargetServer } from "@/server/utils/transfer";
 import { generatePassword } from "@/templates/utils";
 import { createTRPCRouter, protectedProcedure } from "../trpc";
 import { audit } from "../utils/audit";
@@ -1249,5 +1254,203 @@ export const composeRouter = createTRPCRouter({
 				compose.serverId,
 				true,
 			);
+		}),
+
+	transferScan: protectedProcedure
+		.input(apiTransferCompose)
+		.mutation(async ({ input, ctx }) => {
+			await checkServiceAccess(ctx, input.composeId, "delete");
+			const compose = await findComposeById(input.composeId);
+
+			if (
+				compose.environment.project.organizationId !==
+				ctx.session.activeOrganizationId
+			) {
+				throw new TRPCError({
+					code: "UNAUTHORIZED",
+					message: "You are not authorized to transfer this compose",
+				});
+			}
+
+			const targetServerId = await validateTransferTargetServer({
+				targetServerId: input.targetServerId,
+				sourceServerId: compose.serverId,
+				organizationId: ctx.session.activeOrganizationId,
+			});
+
+			return observable<string>((emit) => {
+				scanServiceForTransfer(
+					{
+						serviceId: input.composeId,
+						serviceType: "compose",
+						appName: compose.appName,
+						sourceServerId: compose.serverId,
+						targetServerId,
+					},
+					(progress) => {
+						emit.next(
+							JSON.stringify({
+								type: "scan_progress",
+								payload: progress,
+							}),
+						);
+					},
+				)
+					.then((result) => {
+						emit.next(
+							JSON.stringify({
+								type: "scan_complete",
+								payload: result,
+							}),
+						);
+						emit.complete();
+					})
+					.catch((error) => {
+						const message =
+							error instanceof Error ? error.message : "Unknown scan error";
+						emit.next(
+							JSON.stringify({
+								type: "scan_error",
+								payload: { message },
+							}),
+						);
+						emit.complete();
+					});
+			});
+		}),
+
+	transfer: protectedProcedure
+		.input(
+			apiTransferCompose.extend({
+				decisions: z.record(z.string(), z.enum(["skip", "overwrite"])).optional(),
+			}),
+		)
+		.mutation(async ({ input, ctx }) => {
+			await checkServiceAccess(ctx, input.composeId, "delete");
+			const compose = await findComposeById(input.composeId);
+
+			if (
+				compose.environment.project.organizationId !==
+				ctx.session.activeOrganizationId
+			) {
+				throw new TRPCError({
+					code: "UNAUTHORIZED",
+					message: "You are not authorized to transfer this compose",
+				});
+			}
+
+			const targetServerId = await validateTransferTargetServer({
+				targetServerId: input.targetServerId,
+				sourceServerId: compose.serverId,
+				organizationId: ctx.session.activeOrganizationId,
+			});
+
+			const result = await runTransferWithDowntime({
+				stopSource: async () => {
+					await stopCompose(input.composeId);
+				},
+				startSource: async () => {
+					await startCompose(input.composeId);
+				},
+				executeTransfer: async () =>
+					executeTransfer(
+						{
+							serviceId: input.composeId,
+							serviceType: "compose",
+							appName: compose.appName,
+							sourceServerId: compose.serverId,
+							targetServerId,
+						},
+						input.decisions || {},
+					),
+				commitTransfer: async () => {
+					await db
+						.update(composeTable)
+						.set({ serverId: targetServerId })
+						.where(eq(composeTable.composeId, input.composeId));
+				},
+			});
+
+			if (!result.success) {
+				throw new TRPCError({
+					code: "INTERNAL_SERVER_ERROR",
+					message: `Transfer failed: ${result.errors.join(", ")}`,
+				});
+			}
+
+			return { success: true };
+		}),
+
+	transferWithLogs: protectedProcedure
+		.input(
+			apiTransferCompose.extend({
+				decisions: z.record(z.string(), z.enum(["skip", "overwrite"])).optional(),
+			}),
+		)
+		.subscription(async ({ input, ctx }) => {
+			await checkServiceAccess(ctx, input.composeId, "delete");
+			const compose = await findComposeById(input.composeId);
+
+			if (
+				compose.environment.project.organizationId !==
+				ctx.session.activeOrganizationId
+			) {
+				throw new TRPCError({
+					code: "UNAUTHORIZED",
+					message: "You are not authorized to transfer this compose",
+				});
+			}
+
+			const targetServerId = await validateTransferTargetServer({
+				targetServerId: input.targetServerId,
+				sourceServerId: compose.serverId,
+				organizationId: ctx.session.activeOrganizationId,
+			});
+
+			return observable<string>((emit) => {
+				runTransferWithDowntime({
+					stopSource: async () => {
+						await stopCompose(input.composeId);
+					},
+					startSource: async () => {
+						await startCompose(input.composeId);
+					},
+					executeTransfer: async () =>
+						executeTransfer(
+							{
+								serviceId: input.composeId,
+								serviceType: "compose",
+								appName: compose.appName,
+								sourceServerId: compose.serverId,
+								targetServerId,
+							},
+							input.decisions || {},
+							(progress) => {
+								emit.next(JSON.stringify(progress));
+							},
+						),
+					commitTransfer: async () => {
+						await db
+							.update(composeTable)
+							.set({ serverId: targetServerId })
+							.where(eq(composeTable.composeId, input.composeId));
+					},
+				})
+					.then((result) => {
+						if (result.success) {
+							emit.next("Transfer completed successfully!");
+						} else {
+							const errorMessage = result.errors.join(", ") || "Unknown error";
+							emit.next(`Transfer failed: ${errorMessage}`);
+						}
+						emit.complete();
+					})
+					.catch((error) => {
+						const message =
+							error instanceof Error ? error.message : "Unknown transfer error";
+						emit.next(`Transfer failed: ${message}`);
+						emit.complete();
+					});
+			});
 		}),
 });

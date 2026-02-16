@@ -1256,9 +1256,9 @@ export const composeRouter = createTRPCRouter({
 			);
 		}),
 
-	transferScan: protectedProcedure
+	transferScanWithLogs: protectedProcedure
 		.input(apiTransferCompose)
-		.mutation(async ({ input, ctx }) => {
+		.subscription(async ({ input, ctx }) => {
 			await checkServiceAccess(ctx, input.composeId, "delete");
 			const compose = await findComposeById(input.composeId);
 

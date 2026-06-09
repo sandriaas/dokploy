@@ -101,13 +101,38 @@ pull_image() {
 	$SUDO docker pull "${IMAGE_NAME}:${IMAGE_TAG}"
 }
 
+ensure_internal_services() {
+	if ! $SUDO docker service inspect dokploy-postgres >/dev/null 2>&1; then
+		log "Creating dokploy-postgres..."
+		$SUDO docker service create --detach=true \
+			--name dokploy-postgres \
+			--constraint 'node.role==manager' \
+			--network dokploy-network \
+			--mount type=volume,src=dokploy-postgres,dst=/var/lib/postgresql/data \
+			--env POSTGRES_USER=dokploy \
+			--env POSTGRES_DB=dokploy \
+			--env POSTGRES_PASSWORD=amukds4wi9001583845717ad2 \
+			postgres:16 >/dev/null
+	fi
+
+	if ! $SUDO docker service inspect dokploy-redis >/dev/null 2>&1; then
+		log "Creating dokploy-redis..."
+		$SUDO docker service create --detach=true \
+			--name dokploy-redis \
+			--constraint 'node.role==manager' \
+			--network dokploy-network \
+			--mount type=volume,src=dokploy-redis,dst=/data \
+			redis:7 >/dev/null
+	fi
+}
+
 deploy_service() {
 	if service_exists; then
 		log "Updating ${SERVICE_NAME}..."
-		$SUDO docker service update --force --image "${IMAGE_NAME}:${IMAGE_TAG}" "$SERVICE_NAME" >/dev/null
+		$SUDO docker service update --detach=true --force --image "${IMAGE_NAME}:${IMAGE_TAG}" "$SERVICE_NAME" >/dev/null
 	else
 		log "Creating ${SERVICE_NAME}..."
-		$SUDO docker service create \
+		$SUDO docker service create --detach=true \
 			--name "$SERVICE_NAME" \
 			--constraint 'node.role==manager' \
 			--network dokploy-network \
@@ -123,11 +148,6 @@ deploy_service() {
 main() {
 	install_docker
 
-	if [ "${1:-}" != "update" ] && service_exists; then
-		log "Dokploy already exists. Re-run with 'update' to rebuild from your fork."
-		exit 0
-	fi
-
 	if ! service_exists; then
 		ensure_ports_free
 	fi
@@ -136,6 +156,13 @@ main() {
 	$SUDO chown -R "$(id -u)":"$(id -g)" /etc/dokploy 2>/dev/null || true
 
 	ensure_swarm_and_network
+	ensure_internal_services
+
+	if [ "${1:-}" != "update" ] && service_exists; then
+		log "Dokploy already exists. Re-run with 'update' to pull and apply the latest fork image."
+		exit 0
+	fi
+
 	pull_image
 	deploy_service
 

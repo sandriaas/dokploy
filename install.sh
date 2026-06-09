@@ -1,11 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO_OWNER="${REPO_OWNER:-easyrentbali}"
-REPO_NAME="${REPO_NAME:-dokploy}"
-REPO_REF="${REPO_REF:-transfer-migration}"
-INSTALL_DIR="${INSTALL_DIR:-/opt/dokploy-fork}"
-IMAGE_NAME="${IMAGE_NAME:-dokploy-fork}"
+IMAGE_NAME="${IMAGE_NAME:-easyrentbali/dokploy}"
 IMAGE_TAG="${IMAGE_TAG:-transfer-migration}"
 SERVICE_NAME="${SERVICE_NAME:-dokploy}"
 PORT="${PORT:-3000}"
@@ -83,27 +79,6 @@ install_docker() {
 	$SUDO systemctl enable --now docker >/dev/null 2>&1 || true
 }
 
-prepare_source() {
-	local tmpdir archive extracted_root env_file
-	tmpdir="$(mktemp -d)"
-	archive="$tmpdir/source.tar.gz"
-
-	log "Downloading ${REPO_OWNER}/${REPO_NAME}@${REPO_REF}..."
-	curl -fsSL "https://github.com/${REPO_OWNER}/${REPO_NAME}/archive/refs/heads/${REPO_REF}.tar.gz" -o "$archive"
-	tar -xzf "$archive" -C "$tmpdir"
-
-	extracted_root="$(find "$tmpdir" -mindepth 1 -maxdepth 1 -type d | head -n 1)"
-	if [ -z "${extracted_root:-}" ]; then
-		echo "Failed to extract source archive." >&2
-		exit 1
-	fi
-
-	env_file="$extracted_root/.env.production"
-	printf 'PORT=3000\nNODE_ENV=production\n' > "$env_file"
-
-	printf '%s\n' "$extracted_root"
-}
-
 ensure_swarm_and_network() {
 	if [ "$(docker info --format '{{.Swarm.LocalNodeState}}' 2>/dev/null || true)" != "active" ]; then
 		advertise_addr="$(detect_advertise_addr)"
@@ -121,10 +96,9 @@ ensure_swarm_and_network() {
 	fi
 }
 
-build_image() {
-	local source_dir="$1"
-	log "Building ${IMAGE_NAME}:${IMAGE_TAG}..."
-	$SUDO docker build -t "${IMAGE_NAME}:${IMAGE_TAG}" -f "$source_dir/Dockerfile" "$source_dir"
+pull_image() {
+	log "Pulling ${IMAGE_NAME}:${IMAGE_TAG}..."
+	$SUDO docker pull "${IMAGE_NAME}:${IMAGE_TAG}"
 }
 
 deploy_service() {
@@ -162,9 +136,7 @@ main() {
 	$SUDO chown -R "$(id -u)":"$(id -g)" /etc/dokploy 2>/dev/null || true
 
 	ensure_swarm_and_network
-
-	source_dir="$(prepare_source)"
-	build_image "$source_dir"
+	pull_image
 	deploy_service
 
 	log "Dokploy fork installed successfully."

@@ -204,6 +204,7 @@ export const suggestVariants = async ({
 		    3. The shortDescription should be a single-line summary focusing on key technologies or differentiators
 		    4. All suggestions should be installable in docker and have docker compose support
 		    5. Provide variety in your suggestions - different complexity levels, tech stacks, or approaches
+		    6. Use a neutral, professional tone only. Do not include persona text, profanity, jokes, roleplay, or unrelated opinions.
 
 		    Docker Compose Rules:
 		    1. Use placeholder like \${VARIABLE_NAME-default} for generated variables in the docker-compose.yml

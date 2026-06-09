@@ -6,6 +6,9 @@ IMAGE_TAG="${IMAGE_TAG:-transfer-migration}"
 SERVICE_NAME="${SERVICE_NAME:-dokploy}"
 PORT="${PORT:-3000}"
 DOCKER_VERSION="${DOCKER_VERSION:-28.5.2}"
+TRAEFIK_VERSION="${TRAEFIK_VERSION:-3.6.7}"
+TRAEFIK_PORT="${TRAEFIK_PORT:-80}"
+TRAEFIK_SSL_PORT="${TRAEFIK_SSL_PORT:-443}"
 
 if [ "$(id -u)" -ne 0 ]; then
 	if command -v sudo >/dev/null 2>&1; then
@@ -31,11 +34,11 @@ service_exists() {
 }
 
 ensure_ports_free() {
-	if ss -tulnp | grep -q ":80 "; then
+	if ss -tulnp | grep -q ":${TRAEFIK_PORT} "; then
 		echo "Port 80 is already in use." >&2
 		exit 1
 	fi
-	if ss -tulnp | grep -q ":443 "; then
+	if ss -tulnp | grep -q ":${TRAEFIK_SSL_PORT} "; then
 		echo "Port 443 is already in use." >&2
 		exit 1
 	fi
@@ -43,6 +46,80 @@ ensure_ports_free() {
 		echo "Port ${PORT} is already in use." >&2
 		exit 1
 	fi
+}
+
+create_default_traefik_files() {
+	$SUDO mkdir -p /etc/dokploy/traefik/dynamic
+
+	if [ ! -f /etc/dokploy/traefik/traefik.yml ]; then
+		cat <<EOF | $SUDO tee /etc/dokploy/traefik/traefik.yml >/dev/null
+providers:
+  swarm:
+    exposedByDefault: false
+    watch: true
+  docker:
+    exposedByDefault: false
+    watch: true
+    network: dokploy-network
+  file:
+    directory: /etc/dokploy/traefik/dynamic
+    watch: true
+entryPoints:
+  web:
+    address: :${TRAEFIK_PORT}
+  websecure:
+    address: :${TRAEFIK_SSL_PORT}
+    http3:
+      advertisedPort: ${TRAEFIK_SSL_PORT}
+    http:
+      tls:
+        certResolver: letsencrypt
+api:
+  insecure: true
+certificatesResolvers:
+  letsencrypt:
+    acme:
+      email: test@localhost.com
+      storage: /etc/dokploy/traefik/dynamic/acme.json
+      httpChallenge:
+        entryPoint: web
+EOF
+	fi
+
+	if [ ! -f /etc/dokploy/traefik/dynamic/middlewares.yml ]; then
+		cat <<'EOF' | $SUDO tee /etc/dokploy/traefik/dynamic/middlewares.yml >/dev/null
+http:
+  middlewares:
+    redirect-to-https:
+      redirectScheme:
+        scheme: https
+        permanent: true
+EOF
+	fi
+
+	if [ ! -f /etc/dokploy/traefik/dynamic/dokploy.yml ]; then
+		cat <<EOF | $SUDO tee /etc/dokploy/traefik/dynamic/dokploy.yml >/dev/null
+http:
+  routers:
+    dokploy-router-app:
+      rule: Host(\`dokploy.docker.localhost\`) && PathPrefix(\`/\`)
+      service: dokploy-service-app
+      entryPoints:
+        - web
+  services:
+    dokploy-service-app:
+      loadBalancer:
+        servers:
+          - url: http://dokploy:3000
+        passHostHeader: true
+EOF
+	fi
+
+	if [ ! -f /etc/dokploy/traefik/dynamic/acme.json ]; then
+		$SUDO touch /etc/dokploy/traefik/dynamic/acme.json
+	fi
+
+	$SUDO chmod 600 /etc/dokploy/traefik/dynamic/acme.json
 }
 
 detect_advertise_addr() {
@@ -126,6 +203,31 @@ ensure_internal_services() {
 	fi
 }
 
+ensure_traefik_service() {
+	create_default_traefik_files
+
+	if $SUDO docker service inspect dokploy-traefik >/dev/null 2>&1; then
+		log "Updating dokploy-traefik..."
+		$SUDO docker service update --detach=true --force \
+			--image "traefik:v${TRAEFIK_VERSION}" \
+			dokploy-traefik >/dev/null
+		return
+	fi
+
+	log "Creating dokploy-traefik..."
+	$SUDO docker service create --detach=true \
+		--name dokploy-traefik \
+		--constraint 'node.role==manager' \
+		--network dokploy-network \
+		--mount type=bind,src=/etc/dokploy/traefik/traefik.yml,dst=/etc/traefik/traefik.yml \
+		--mount type=bind,src=/etc/dokploy/traefik/dynamic,dst=/etc/dokploy/traefik/dynamic \
+		--mount type=bind,src=/var/run/docker.sock,dst=/var/run/docker.sock \
+		--publish "published=${TRAEFIK_PORT},target=80,mode=host" \
+		--publish "published=${TRAEFIK_SSL_PORT},target=443,mode=host" \
+		--publish "published=${TRAEFIK_SSL_PORT},target=443,mode=host,protocol=udp" \
+		"traefik:v${TRAEFIK_VERSION}" >/dev/null
+}
+
 deploy_service() {
 	if service_exists; then
 		log "Updating ${SERVICE_NAME}..."
@@ -157,6 +259,7 @@ main() {
 
 	ensure_swarm_and_network
 	ensure_internal_services
+	ensure_traefik_service
 
 	if [ "${1:-}" != "update" ] && service_exists; then
 		log "Dokploy already exists. Re-run with 'update' to pull and apply the latest fork image."

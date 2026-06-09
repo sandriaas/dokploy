@@ -36,6 +36,6 @@ jobs:
           context: .
           file: ./Dockerfile
           push: true
-          tags: ghcr.io/easyrentbali/dokploy:transfer-migration
+          tags: ghcr.io/sandriaas/dokploy:transfer-migration
           platforms: linux/amd64
           provenance: false

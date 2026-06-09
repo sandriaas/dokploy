@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-IMAGE_NAME="${IMAGE_NAME:-ghcr.io/easyrentbali/dokploy}"
+IMAGE_NAME="${IMAGE_NAME:-ghcr.io/sandriaas/dokploy}"
 IMAGE_TAG="${IMAGE_TAG:-transfer-migration}"
 SERVICE_NAME="${SERVICE_NAME:-dokploy}"
 PORT="${PORT:-3000}"

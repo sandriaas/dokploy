@@ -2,7 +2,7 @@ import { db } from "@dokploy/server/db";
 import { ai } from "@dokploy/server/db/schema";
 import { selectAIProvider } from "@dokploy/server/utils/ai/select-ai-provider";
 import { TRPCError } from "@trpc/server";
-import { generateText, Output } from "ai";
+import { generateText } from "ai";
 import { desc, eq } from "drizzle-orm";
 import { z } from "zod";
 import { IS_CLOUD } from "../constants";
@@ -26,6 +26,26 @@ interface DockerOutput {
 	domains: Array<{ host: string; port: number; serviceName: string }>;
 	configFiles?: Array<{ content: string; filePath: string }>;
 }
+
+const extractJsonObject = (text: string) => {
+	const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
+	const candidate = (fenced?.[1] || text).trim();
+
+	try {
+		return JSON.parse(candidate);
+	} catch {
+		// Some providers wrap valid JSON in markdown or explanatory text.
+	}
+
+	const start = candidate.indexOf("{");
+	const end = candidate.lastIndexOf("}");
+
+	if (start === -1 || end === -1 || end <= start) {
+		throw new Error("AI response did not contain a JSON object");
+	}
+
+	return JSON.parse(candidate.slice(start, end + 1));
+};
 
 export const getAiSettingsByOrganizationId = async (organizationId: string) => {
 	const aiSettings = await db.query.ai.findMany({
@@ -143,8 +163,6 @@ export const suggestVariants = async ({
 
 		const result = await generateText({
 			model,
-			// @ts-ignore - Zod + AI SDK Output.object() causes excessively deep instantiation
-			output: Output.object({ schema: fullSchema }),
 			prompt: `
 		    Act as advanced DevOps engineer. Analyze the user's request and generate up to 3 deployment suggestions, each with a complete docker compose configuration.
 
@@ -162,7 +180,9 @@ export const suggestVariants = async ({
 		    - Example: For "personal blog" → "WordPress", "Ghost", "Hugo with Nginx"
 		    - The name should be the actual project name
 
-		    Return your response as a JSON object with this structure:
+		    Return ONLY a valid JSON object. Do not include markdown, prose, code fences, comments, or any text before or after the JSON.
+
+		    The JSON object must use this structure:
 		    {
 		      "suggestions": [
 		        {
@@ -238,9 +258,20 @@ export const suggestVariants = async ({
 		  `,
 		});
 
-		const output = result.output as
-			| { suggestions: (SuggestionItem & DockerOutput)[] }
-			| undefined;
+		let output: { suggestions: (SuggestionItem & DockerOutput)[] };
+		try {
+			output = fullSchema.parse(extractJsonObject(result.text));
+		} catch (error) {
+			console.error("Invalid AI JSON response:", {
+				error,
+				response: result.text,
+			});
+			throw new TRPCError({
+				code: "BAD_REQUEST",
+				message:
+					"The selected AI model did not return valid JSON. Try a stronger model or rerun the request.",
+			});
+		}
 
 		if (!output?.suggestions?.length) {
 			throw new TRPCError({

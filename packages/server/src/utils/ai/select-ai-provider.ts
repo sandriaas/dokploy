@@ -7,6 +7,112 @@ import { createOpenAI } from "@ai-sdk/openai";
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
 import { createOllama } from "ai-sdk-ollama";
 
+const normalizeEventStreamResponse = async (
+	response: Response,
+	requestBody: Record<string, unknown>,
+) => {
+	const text = await response.text();
+	if (!text.trimStart().startsWith("data:")) {
+		return new Response(text, {
+			status: response.status,
+			statusText: response.statusText,
+			headers: response.headers,
+		});
+	}
+
+	let id: string | undefined;
+	let created: number | undefined;
+	let model: string | undefined;
+	let role = "assistant";
+	let content = "";
+	let finishReason = "stop";
+	let usage: unknown;
+
+	for (const line of text.split(/\r?\n/)) {
+		const trimmed = line.trim();
+		if (!trimmed.startsWith("data:")) {
+			continue;
+		}
+
+		const payload = trimmed.slice(5).trim();
+		if (!payload || payload === "[DONE]") {
+			continue;
+		}
+
+		const chunk = JSON.parse(payload);
+		id ??= chunk.id;
+		created ??= chunk.created;
+		model ??= chunk.model;
+		usage ??= chunk.usage;
+
+		const choice = chunk.choices?.[0];
+		if (choice?.delta?.role) {
+			role = choice.delta.role;
+		}
+		if (choice?.delta?.content) {
+			content += choice.delta.content;
+		}
+		if (choice?.finish_reason) {
+			finishReason = choice.finish_reason;
+		}
+	}
+
+	return new Response(
+		JSON.stringify({
+			id: id || "omniroute-sse-response",
+			object: "chat.completion",
+			created: created || Math.floor(Date.now() / 1000),
+			model: model || requestBody.model,
+			choices: [
+				{
+					index: 0,
+					message: {
+						role,
+						content,
+					},
+					finish_reason: finishReason,
+				},
+			],
+			usage,
+		}),
+		{
+			status: response.status,
+			statusText: response.statusText,
+			headers: {
+				"content-type": "application/json",
+			},
+		},
+	);
+};
+
+const parseRequestBody = (body: BodyInit | null | undefined) => {
+	if (typeof body !== "string") {
+		return {};
+	}
+
+	try {
+		const parsed = JSON.parse(body);
+		return parsed && typeof parsed === "object" ? parsed : {};
+	} catch {
+		return {};
+	}
+};
+
+const createOmniRouteFetch = (): typeof fetch => async (url, init) => {
+	const response = await fetch(url, init);
+	const contentType = response.headers.get("content-type") || "";
+	const requestBody = parseRequestBody(init?.body);
+
+	if (
+		requestBody?.stream === true ||
+		!contentType.includes("text/event-stream")
+	) {
+		return response;
+	}
+
+	return normalizeEventStreamResponse(response, requestBody);
+};
+
 export function getProviderName(apiUrl: string) {
 	if (apiUrl.includes("api.openai.com")) return "openai";
 	if (apiUrl.includes("azure.com")) return "azure";
@@ -121,6 +227,9 @@ export function selectAIProvider(config: { apiUrl: string; apiKey: string }) {
 				headers: {
 					Authorization: `Bearer ${config.apiKey}`,
 				},
+				fetch: config.apiUrl.includes("omniroute")
+					? createOmniRouteFetch()
+					: undefined,
 			});
 		default:
 			throw new Error(`Unsupported AI provider: ${providerName}`);
